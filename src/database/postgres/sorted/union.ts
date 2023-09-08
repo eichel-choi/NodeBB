@@ -1,83 +1,124 @@
-'use strict';
+// I actively made use of ChatGPT to get the outline of the code, please forgive me.
 
-module.exports = function (module: any): void {
+type AggregateType = { $sum: string; $avg: string; };
+type ProjectType = { [key: string]: number | string; };
+type DataType = {count: number};
+
+type ParamsType = {
+    sets: string[];
+    start: number;
+    stop: number;
+    sort: number;
+    aggregate?: string;
+    withScores?: boolean;
+}
+
+type Type1 = { $match: { _key: { $in: string[] } } };
+type Type2 = { $group: { _id: { value: string }; totalScore: AggregateType } };
+type Type3 = { $sort: { totalScore: number } };
+type Type4 = { $skip: number };
+type Type5 = { $limit: number };
+type Type6 = { $project: ProjectType };
+type Type7 = { $group: { _id: { value: string } } };
+type Type8 = { $group: { _id: null, count: { $sum: number } } };
+
+type AggregationStage = Type1 | Type2 | Type3 | Type4 | Type5 | Type6 | Type7 | Type8;
+
+module.exports = function (module: {
+    getSortedSetRevUnion: (params: ParamsType) => Promise<DataType[]>;
+    sortedSetUnionCard(keys: string[]): Promise<number>;
+    getSortedSetUnion(params: ParamsType): Promise<DataType[]>;
+    client: {
+        collection(a: string): {
+            aggregate(b: AggregationStage[]): {
+                toArray: () => Promise<DataType[]>
+            };
+        };
+    };
+  }) {
     module.sortedSetUnionCard = async function (keys: string[]): Promise<number> {
         if (!Array.isArray(keys) || !keys.length) {
             return 0;
         }
 
-        const res = await module.pool.query({
-            name: 'sortedSetUnionCard',
-            text: `
-SELECT COUNT(DISTINCT z."value") c
-  FROM "legacy_object_live" o
- INNER JOIN "legacy_zset" z
-         ON o."_key" = z."_key"
-        AND o."type" = z."type"
- WHERE o."_key" = ANY($1::TEXT[])`,
-            values: [keys],
-        });
-        return res.rows[0].c;
+        const data = await module.client.collection('objects').aggregate([
+            { $match: { _key: { $in: keys } } },
+            { $group: { _id: { value: '$value' } } },
+            { $group: { _id: null, count: { $sum: 1 } } },
+        ]).toArray();
+        return Array.isArray(data) && data.length ? data[0].count : 0;
     };
 
-    module.getSortedSetUnion = async function (params: any): Promise<any> {
+    async function getSortedSetUnion(params: {
+        sets: string[];
+        start: number;
+        stop: number;
+        sort: number;
+        aggregate?: string;
+        withScores?: boolean;
+        interval?: number;
+      }): Promise<DataType[]> {
+        if (!Array.isArray(params.sets) || !params.sets.length) {
+            return [];
+        }
+        let limit = params.stop - params.start + 1;
+        if (limit <= 0) {
+            limit = 0;
+        }
+
+        const aggregate: AggregateType = {
+            $sum: '',
+            $avg: '',
+        };
+        if (params.aggregate) {
+            aggregate[`$${params.aggregate.toLowerCase()}`] = '$score';
+        } else {
+            aggregate.$sum = '$score';
+        }
+
+        const pipeline: AggregationStage[] = [
+            { $match: { _key: { $in: params.sets } } },
+            { $group: { _id: { value: '$value' }, totalScore: aggregate } },
+            { $sort: { totalScore: params.sort } },
+        ];
+
+
+        if (params.start) {
+            pipeline.push({ $skip: params.start });
+        }
+
+        if (limit > 0) {
+            pipeline.push({ $limit: limit });
+        }
+
+        type ProjectType = {
+            [key: string]: number | string;
+        };
+
+        const project: ProjectType = {
+            _id: 0,
+            value: '$_id.value',
+            score: '$totalScore',
+        };
+        if (params.withScores) {
+            project.score = '$totalScore';
+        }
+        pipeline.push({ $project: project });
+
+        let data: DataType[] = await module.client.collection('objects').aggregate(pipeline).toArray();
+        if (!params.withScores) {
+            data = data.map((value: DataType) => value);
+        }
+        return data;
+    }
+
+    module.getSortedSetUnion = async function (params: ParamsType): Promise<DataType[]> {
         params.sort = 1;
         return await getSortedSetUnion(params);
     };
 
-    module.getSortedSetRevUnion = async function (params: any): Promise<any> {
+    module.getSortedSetRevUnion = async function (params: ParamsType): Promise<DataType[]> {
         params.sort = -1;
         return await getSortedSetUnion(params);
     };
-
-    async function getSortedSetUnion(params: any): Promise<any> {
-        const { sets } = params;
-        const start = params.hasOwnProperty('start') ? params.start : 0;
-        const stop = params.hasOwnProperty('stop') ? params.stop : -1;
-        let weights = params.weights || [];
-        const aggregate = params.aggregate || 'SUM';
-
-        if (sets.length < weights.length) {
-            weights = weights.slice(0, sets.length);
-        }
-        while (sets.length > weights.length) {
-            weights.push(1);
-        }
-
-        let limit = stop - start + 1;
-        if (limit <= 0) {
-            limit = null;
-        }
-
-        const res = await module.pool.query({
-            name: `getSortedSetUnion${aggregate}${params.sort > 0 ? 'Asc' : 'Desc'}WithScores`,
-            text: `
-WITH A AS (SELECT z."value",
-                  ${aggregate}(z."score" * k."weight") "score"
-             FROM UNNEST($1::TEXT[], $2::NUMERIC[]) k("_key", "weight")
-            INNER JOIN "legacy_object_live" o
-                    ON o."_key" = k."_key"
-            INNER JOIN "legacy_zset" z
-                    ON o."_key" = z."_key"
-                   AND o."type" = z."type"
-            GROUP BY z."value")
-SELECT A."value",
-       A."score"
-  FROM A
- ORDER BY A."score" ${params.sort > 0 ? 'ASC' : 'DESC'}
- LIMIT $4::INTEGER
-OFFSET $3::INTEGER`,
-            values: [sets, weights, start, limit],
-        });
-
-        if (params.withScores) {
-            res.rows = res.rows.map((r: any) => ({
-                value: r.value,
-                score: parseFloat(r.score),
-            }));
-        } else {
-            res.rows = res.rows.map((r: any) => r.value);
-        }
-        return res.rows;
-    }
 };
